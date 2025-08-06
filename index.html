@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Website Builder</title>
+</head>
+<body>
+    <h1>Website Build System</h1>
+    <p id="status">Starting build system...</p>
+    <button id="start-build" style="display: none;">Select New Folders</button>
+    <button id="request-permission" style="display: none;">Request Permission</button>
+    <button id="rebuild" style="display: none;">Rebuild</button>
+    <div id="log"></div>
+
+    <script type="module">
+        import { marked } from 'https://unpkg.com/marked';
+        import { get, set } from 'https://unpkg.com/idb-keyval@5.0.2/dist/esm/index.js';
+
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+        const startBtn = document.getElementById('start-build');
+        const requestPermBtn = document.getElementById('request-permission');
+        const rebuildBtn = document.getElementById('rebuild');
+
+        let inputHandle = null;
+        let outputHandle = null;
+
+        function log(message) {
+            const p = document.createElement('p');
+            p.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+            logEl.appendChild(p);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function updateStatus(message) {
+            statusEl.textContent = message;
+            log(message);
+        }
+
+        async function processMarkdown(content, fileName) {
+            const html = marked.parse(content);
+            return {
+                html,
+                title: extractTitle(content, fileName),
+                excerpt: extractExcerpt(content)
+            };
+        }
+
+        function extractTitle(content, fileName) {
+            const titleMatch = content.match(/^#\s+(.+)$/m);
+            return titleMatch ? titleMatch[1] : fileName.replace('.md', '');
+        }
+
+        function extractExcerpt(content) {
+            const lines = content.split('\n');
+            let excerpt = '';
+            for (const line of lines) {
+                if (line.trim() && !line.startsWith('#')) {
+                    excerpt = line.trim();
+                    break;
+                }
+            }
+            return excerpt || 'No excerpt available';
+        }
+
+        function generateBlogIndex(posts) {
+            return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blog</title>
+</head>
+<body>
+    <header>
+        <h1>Blog</h1>
+        <nav>
+            <a href="../index.html">Home</a>
+        </nav>
+    </header>
+    <main>
+        ${posts.map(post => `
+        <article>
+            <h2><a href="${post.slug}/index.html">${post.title}</a></h2>
+            <p>${post.excerpt}</p>
+            <time>${post.date}</time>
+        </article>
+        `).join('')}
+    </main>
+</body>
+</html>`;
+        }
+
+        function generatePostPage(post) {
+            return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${post.title}</title>
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="../index.html">← Back to Blog</a>
+        </nav>
+    </header>
+    <main>
+        <article>
+            ${post.html}
+        </article>
+    </main>
+</body>
+</html>`;
+        }
+
+        function generateSiteIndex(sections) {
+            return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Website</title>
+</head>
+<body>
+    <header>
+        <h1>My Website</h1>
+    </header>
+    <main>
+        <nav>
+            ${sections.map(section => `
+            <a href="${section}/index.html">${section.charAt(0).toUpperCase() + section.slice(1)}</a>
+            `).join('')}
+        </nav>
+    </main>
+</body>
+</html>`;
+        }
+
+        function generateRSSFeed(posts, siteTitle = "My Website") {
+            const rssItems = posts.map(post => `
+    <item>
+        <title>${post.title}</title>
+        <description>${post.excerpt}</description>
+        <link>./blog/${post.slug}/index.html</link>
+        <pubDate>${new Date(post.date).toUTCString()}</pubDate>
+    </item>`).join('');
+
+            return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+    <channel>
+        <title>${siteTitle}</title>
+        <description>Latest blog posts</description>
+        <link>./index.html</link>
+        <language>en</language>
+        ${rssItems}
+    </channel>
+</rss>`;
+        }
+
+        async function processInputFolder(inputHandle, outputHandle) {
+            const sections = [];
+            const allPosts = [];
+
+            for await (const [name, handle] of inputHandle.entries()) {
+                if (handle.kind === 'directory') {
+                    sections.push(name);
+                    
+                    if (name === 'blog') {
+                        const posts = await processBlogFolder(handle, outputHandle);
+                        allPosts.push(...posts);
+                    } else {
+                        await processSection(name, handle, outputHandle);
+                    }
+                }
+            }
+
+            // Generate site index
+            const siteIndexHtml = generateSiteIndex(sections);
+            await saveFile(outputHandle, 'index.html', siteIndexHtml);
+
+            // Generate RSS feed
+            if (allPosts.length > 0) {
+                const rssXml = generateRSSFeed(allPosts);
+                await saveFile(outputHandle, 'feed.xml', rssXml);
+            }
+
+            log(`Generated site index and RSS feed`);
+        }
+
+        async function processBlogFolder(blogHandle, outputHandle) {
+            const posts = [];
+            const blogOutputHandle = await outputHandle.getDirectoryHandle('blog', { create: true });
+
+            for await (const [folderName, folderHandle] of blogHandle.entries()) {
+                if (folderHandle.kind === 'directory') {
+                    for await (const [fileName, fileHandle] of folderHandle.entries()) {
+                        if (fileName.endsWith('.md')) {
+                            const file = await fileHandle.getFile();
+                            const content = await file.text();
+                            const processed = await processMarkdown(content, fileName);
+                            
+                            const post = {
+                                ...processed,
+                                slug: folderName,
+                                date: file.lastModified ? new Date(file.lastModified).toISOString().split('T')[0] : new Date().toISOString().split('T')[0]
+                            };
+
+                            posts.push(post);
+
+                            // Create post directory and file
+                            const postDirHandle = await blogOutputHandle.getDirectoryHandle(folderName, { create: true });
+                            const postHtml = generatePostPage(post);
+                            await saveFile(postDirHandle, 'index.html', postHtml);
+
+                            log(`Processed blog post: ${post.title}`);
+                        }
+                    }
+                }
+            }
+
+            // Generate blog index
+            posts.sort((a, b) => new Date(b.date) - new Date(a.date));
+            const blogIndexHtml = generateBlogIndex(posts);
+            await saveFile(blogOutputHandle, 'index.html', blogIndexHtml);
+
+            return posts;
+        }
+
+        async function processSection(sectionName, sectionHandle, outputHandle) {
+            const sectionOutputHandle = await outputHandle.getDirectoryHandle(sectionName, { create: true });
+
+            for await (const [fileName, fileHandle] of sectionHandle.entries()) {
+                if (fileName.endsWith('.md')) {
+                    const file = await fileHandle.getFile();
+                    const content = await file.text();
+                    const processed = await processMarkdown(content, fileName);
+                    
+                    const pageHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${processed.title}</title>
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="../index.html">← Home</a>
+        </nav>
+    </header>
+    <main>
+        ${processed.html}
+    </main>
+</body>
+</html>`;
+
+                    await saveFile(sectionOutputHandle, 'index.html', pageHtml);
+                    log(`Processed ${sectionName} page: ${processed.title}`);
+                }
+            }
+        }
+
+        async function saveFile(dirHandle, fileName, content) {
+            const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(content);
+            await writable.close();
+        }
+
+        async function selectFolders() {
+            try {
+                updateStatus('Selecting input folder...');
+                inputHandle = await window.showDirectoryPicker();
+                await set('inputDirectory', inputHandle);
+                
+                updateStatus('Selecting output folder...');
+                outputHandle = await window.showDirectoryPicker();
+                await set('outputDirectory', outputHandle);
+
+                log(`Selected input: ${inputHandle.name}, output: ${outputHandle.name}`);
+                
+                // Reset button text for future use
+                startBtn.textContent = 'Select New Folders';
+                return true;
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    updateStatus('Folder selection cancelled. Click below to try again.');
+                    startBtn.textContent = 'Try Again';
+                    startBtn.style.display = 'inline-block';
+                } else if (error.message.includes('user gesture')) {
+                    updateStatus('Browser requires a click to show folder picker. Click below to continue.');
+                    startBtn.textContent = 'Select Folders';
+                    startBtn.style.display = 'inline-block';
+                } else {
+                    updateStatus(`Folder selection error: ${error.message}`);
+                    startBtn.textContent = 'Try Again';
+                    startBtn.style.display = 'inline-block';
+                }
+                return false;
+            }
+        }
+
+        async function runBuild() {
+            if (!inputHandle || !outputHandle) {
+                updateStatus('No folders selected');
+                return;
+            }
+
+            try {
+                updateStatus('Processing files...');
+                await processInputFolder(inputHandle, outputHandle);
+
+                updateStatus('Build complete! Ready for rebuilds...');
+                
+                // Hide the start and permission buttons, show rebuild button
+                startBtn.style.display = 'none';
+                requestPermBtn.style.display = 'none';
+                rebuildBtn.style.display = 'inline-block';
+                
+            } catch (error) {
+                updateStatus(`Build error: ${error.message}`);
+                console.error(error);
+                
+                // Show start button for retry if build fails
+                startBtn.textContent = 'Try Again';
+                startBtn.style.display = 'inline-block';
+            }
+        }
+
+        async function autoStart() {
+            try {
+                updateStatus('Checking for saved folders...');
+                
+                // Try to get saved directory handles
+                const savedInputHandle = await get('inputDirectory');
+                const savedOutputHandle = await get('outputDirectory');
+
+                if (savedInputHandle && savedOutputHandle) {
+                    // Verify we still have access
+                    try {
+                        updateStatus('Requesting permission for saved folders...');
+                        
+                        const inputPermission = await savedInputHandle.requestPermission({ mode: 'read' });
+                        const outputPermission = await savedOutputHandle.requestPermission({ mode: 'readwrite' });
+                        
+                        if (inputPermission === 'granted' && outputPermission === 'granted') {
+                            inputHandle = savedInputHandle;
+                            outputHandle = savedOutputHandle;
+                            
+                            updateStatus(`Using saved folders: ${inputHandle.name} → ${outputHandle.name}`);
+                            log('Permissions granted for saved folders');
+                            
+                            // Auto-build
+                            await runBuild();
+                            return;
+                        } else {
+                            log('Permission denied for saved folders');
+                            throw new Error('Permission denied');
+                        }
+                    } catch (permError) {
+                        log(`Permission refresh needed: ${permError.message}`);
+                        updateStatus('Saved folders found but need permission refresh...');
+                        
+                        // Show permission request button instead of auto-triggering
+                        updateStatus('Saved folders found but need permission. Click to request access.');
+                        requestPermBtn.style.display = 'inline-block';
+                        startBtn.textContent = 'Select Different Folders';
+                        startBtn.style.display = 'inline-block';
+                        return;
+                    }
+                }
+
+                // No saved folders, prompt user
+                updateStatus('No saved folders found. Click "Select New Folders" to begin.');
+                startBtn.style.display = 'inline-block';
+                
+            } catch (error) {
+                updateStatus('Ready - click "Select New Folders" to begin');
+                startBtn.style.display = 'inline-block';
+                log(`Auto-start error: ${error.message}`);
+            }
+        }
+
+        async function requestPermissionOnSavedFolders() {
+            try {
+                updateStatus('Requesting permission for saved folders...');
+                
+                const savedInputHandle = await get('inputDirectory');
+                const savedOutputHandle = await get('outputDirectory');
+                
+                if (!savedInputHandle || !savedOutputHandle) {
+                    updateStatus('No saved folders found. Please select folders.');
+                    startBtn.style.display = 'inline-block';
+                    return false;
+                }
+
+                const inputPermission = await savedInputHandle.requestPermission({ mode: 'read' });
+                const outputPermission = await savedOutputHandle.requestPermission({ mode: 'readwrite' });
+                
+                if (inputPermission === 'granted' && outputPermission === 'granted') {
+                    inputHandle = savedInputHandle;
+                    outputHandle = savedOutputHandle;
+                    
+                    updateStatus(`Permission granted! Using folders: ${inputHandle.name} → ${outputHandle.name}`);
+                    log('Permissions successfully refreshed for saved folders');
+                    
+                    // Hide permission button and auto-build
+                    requestPermBtn.style.display = 'none';
+                    await runBuild();
+                    return true;
+                } else {
+                    updateStatus('Permission denied. You can select new folders instead.');
+                    requestPermBtn.style.display = 'none';
+                    startBtn.style.display = 'inline-block';
+                    return false;
+                }
+                
+            } catch (error) {
+                updateStatus(`Permission request failed: ${error.message}`);
+                log(`Permission error: ${error.message}`);
+                
+                // Hide permission button and show folder selection
+                requestPermBtn.style.display = 'none';
+                startBtn.style.display = 'inline-block';
+                return false;
+            }
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', async () => {
+            if (await selectFolders()) {
+                await runBuild();
+            }
+        });
+
+        requestPermBtn.addEventListener('click', requestPermissionOnSavedFolders);
+
+        rebuildBtn.addEventListener('click', runBuild);
+
+        // Auto-start immediately when DOM is ready (faster than 'load' event)
+        document.addEventListener('DOMContentLoaded', autoStart);
+        
+        // Also support URL parameters for input folder hint
+        async function checkURLParams() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const inputPath = urlParams.get('input');
+            const outputPath = urlParams.get('output');
+            
+            if (inputPath) {
+                log(`URL suggests input path: ${inputPath}`);
+            }
+            if (outputPath) {
+                log(`URL suggests output path: ${outputPath}`);
+            }
+        }
+
+        // Auto-start on page load (backup)
+        window.addEventListener('load', () => {
+            checkURLParams();
+            // autoStart already called by DOMContentLoaded
+        });
+    </script>
+</body>
+</html> 
